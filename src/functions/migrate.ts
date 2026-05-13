@@ -32,7 +32,8 @@ export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
       let Database: any;
       try {
         // @ts-expect-error optional dependency
-        Database = (await import("better-sqlite3")).default;
+        const sqlite = await import("better-sqlite3");
+        Database = sqlite.default ?? sqlite;
       } catch {
         return {
           success: false,
@@ -57,8 +58,9 @@ export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
           .prepare("SELECT * FROM sessions ORDER BY created_at DESC")
           .all() as any[];
         for (const row of sessions) {
+          const sessionId = String(row.session_id ?? row.id ?? generateId("mig"));
           const session: Session = {
-            id: row.session_id || row.id,
+            id: sessionId,
             project: row.project_path || row.project || "unknown",
             cwd: row.cwd || row.project_path || "",
             startedAt:
@@ -89,9 +91,10 @@ export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
         }
 
         for (const row of observations) {
-          const sessionId = row.session_id || "migrated";
+          const sessionId = String(row.session_id ?? row.sessionId ?? "migrated");
+          const obsId = String(row.id ?? generateId("mig"));
           const obs: CompressedObservation = {
-            id: row.id || generateId("mig"),
+            id: obsId,
             sessionId,
             timestamp: row.created_at || new Date().toISOString(),
             type: row.type || "other",
@@ -117,8 +120,11 @@ export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
         }
 
         for (const row of summaries) {
+          const summarySessionId = String(
+            row.session_id ?? row.sessionId ?? row.id ?? "migrated",
+          );
           const summary: SessionSummary = {
-            sessionId: row.session_id,
+            sessionId: summarySessionId,
             project: row.project || "unknown",
             createdAt: row.created_at || new Date().toISOString(),
             title: row.title || "Migrated session",
@@ -128,7 +134,7 @@ export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
             concepts: safeJsonParse(row.concepts, []),
             observationCount: row.observation_count || 0,
           };
-          await kv.set(KV.summaries, row.session_id, summary);
+          await kv.set(KV.summaries, summarySessionId, summary);
           summaryCount++;
         }
 
