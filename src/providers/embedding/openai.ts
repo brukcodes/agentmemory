@@ -3,6 +3,7 @@ import { getEnvVar } from "../../config.js";
 
 const DEFAULT_BASE_URL = "https://api.openai.com";
 const DEFAULT_MODEL = "text-embedding-3-small";
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 /**
  * Known OpenAI embedding model dimensions. Extend as new models ship.
@@ -17,7 +18,10 @@ const MODEL_DIMENSIONS: Record<string, number> = {
 
 const DEFAULT_DIMENSIONS = MODEL_DIMENSIONS[DEFAULT_MODEL] ?? 1536;
 
-function resolveDimensions(model: string, override: string | undefined): number {
+function resolveDimensions(
+  model: string,
+  override: string | undefined,
+): number {
   if (override !== undefined && override.trim().length > 0) {
     const parsed = parseInt(override, 10);
     if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -28,6 +32,20 @@ function resolveDimensions(model: string, override: string | undefined): number 
     return parsed;
   }
   return MODEL_DIMENSIONS[model] ?? DEFAULT_DIMENSIONS;
+}
+
+function getLLMTimeout(): number {
+  const raw = getEnvVar("AGENTMEMORY_LLM_TIMEOUT_MS");
+  if (!raw) return DEFAULT_TIMEOUT_MS;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `[agentmemory] warn: AGENTMEMORY_LLM_TIMEOUT_MS="${raw}" is invalid; ` +
+        `falling back to default ${DEFAULT_TIMEOUT_MS}ms.\n`,
+    );
+    return DEFAULT_TIMEOUT_MS;
+  }
+  return parsed;
 }
 
 /**
@@ -42,6 +60,7 @@ function resolveDimensions(model: string, override: string | undefined): number 
  *   OPENAI_EMBEDDING_DIMENSIONS — override reported dimensions (required for
  *                                 custom / self-hosted models not in the
  *                                 MODEL_DIMENSIONS table above)
+ *   AGENTMEMORY_LLM_TIMEOUT_MS  — request timeout in ms (default: 30000)
  */
 export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   readonly name = "openai";
@@ -53,10 +72,8 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   constructor(apiKey?: string) {
     this.apiKey = apiKey || getEnvVar("OPENAI_API_KEY") || "";
     if (!this.apiKey) throw new Error("OPENAI_API_KEY is required");
-    this.baseUrl =
-      getEnvVar("OPENAI_BASE_URL") || DEFAULT_BASE_URL;
-    this.model =
-      getEnvVar("OPENAI_EMBEDDING_MODEL") || DEFAULT_MODEL;
+    this.baseUrl = getEnvVar("OPENAI_BASE_URL") || DEFAULT_BASE_URL;
+    this.model = getEnvVar("OPENAI_EMBEDDING_MODEL") || DEFAULT_MODEL;
     this.dimensions = resolveDimensions(
       this.model,
       getEnvVar("OPENAI_EMBEDDING_DIMENSIONS"),
@@ -70,17 +87,35 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
 
   async embedBatch(texts: string[]): Promise<Float32Array[]> {
     const url = `${this.baseUrl}/v1/embeddings`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: this.model,
-        input: texts,
-      }),
-    });
+    const timeoutMs = getLLMTimeout();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: this.model,
+          input: texts,
+        }),
+        signal: controller.signal,
+      });
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === "AbortError") {
+        throw new Error(
+          `OpenAI embedding request timed out after ${timeoutMs}ms. ` +
+            `Increase AGENTMEMORY_LLM_TIMEOUT_MS to allow more time.`,
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!response.ok) {
       const err = await response.text();
